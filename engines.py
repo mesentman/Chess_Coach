@@ -1,110 +1,140 @@
-"""
-engines.py - Stateless calculation layer handles Chess.com REST APIs,
-native Stockfish binaries, and prompt engineering orchestration with Ollama.
-"""
-
 import io
+import time
+import queue
+import threading
 import requests
-import chess
 import chess.pgn
-import ollama
+import chess
 from stockfish import Stockfish
+import ollama
 
-class ChessEngineWorker:
-    def __init__(self, stockfish_path="stockfish", model_name="llama3", depth=12):
-        self.model_name = model_name
-        self.depth = depth
-        self.stockfish = None
+def pgn_fetch_callback(username, year, month):
+    """
+    Fetches the archives from the Chess.com public API.
+    Returns a list of dictionaries with game metadata and PGNs (max 15).
+    """
+    url = f"https://api.chess.com/pub/player/{username}/games/{year}/{month:02d}"
+    headers = {"User-Agent": "DesktopAIChessCoach/4.0 (contact: admin@example.com)"}
+    
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
         
-        # Defensive Subprocess Validation Path
-        if stockfish_path:
-            try:
-                self.stockfish = Stockfish(path=stockfish_path, depth=self.depth)
-            except (FileNotFoundError, Exception):
-                # Fallback: Allows structural application navigation without system crashes
-                self.stockfish = None
+        games = data.get("games", [])[-15:] # Get the last 15 games
+        parsed_games = []
+        
+        for game in games:
+            pgn_str = game.get("pgn", "")
+            if pgn_str:
+                pgn_io = io.StringIO(pgn_str)
+                parsed_game = chess.pgn.read_game(pgn_io)
+                white = parsed_game.headers.get("White", "Unknown")
+                black = parsed_game.headers.get("Black", "Unknown")
+                parsed_games.append({
+                    "label": f"{white} vs {black}",
+                    "white": white,
+                    "black": black,
+                    "pgn": pgn_str,
+                    "game_obj": parsed_game
+                })
+        return parsed_games
+    except Exception as e:
+        print(f"Error fetching games: {e}")
+        return []
 
-    def pgn_fetch_callback(self, username):
-        """
-        Fetches the latest completed game PGN for a given Chess.com user profile.
-        Implements defensive transport validation blocks for HTTP limits.
-        """
-        try:
-            headers = {"User-Agent": "DesktopAIChessCoach/4.0.0 (contact: admin@local.ai)"}
-            url = f"https://api.chess.com/pub/player/{username}/games/archives"
-            
-            res = requests.get(url, headers=headers, timeout=8)
-            if res.status_code != 200:
-                return None
-                
-            archives = res.json().get("archives", [])
-            if not archives:
-                return None
-            
-            # Extract historical match logs from the latest operational month archive
-            latest_month_url = archives[-1]
-            res_games = requests.get(latest_month_url, headers=headers, timeout=8)
-            if res_games.status_code != 200:
-                return None
-                
-            games = res_games.json().get("games", [])
-            if not games:
-                return None
-                
-            # Return the raw PGN record array block of the most recently finalized game
-            return games[-1].get("pgn", None)
-        except Exception:
-            return None
+class PonderWorker:
+    """
+    Background worker that continuously evaluates the current FEN at increasing depths
+    and pushes the results to a thread-safe queue for the GUI.
+    """
+    def __init__(self, stockfish_path, result_queue, threads=2):
+        self.stockfish = Stockfish(path=stockfish_path, parameters={"Threads": threads, "Hash": 256})
+        self.result_queue = result_queue
+        self.current_fen = None
+        self.lock = threading.Lock()
+        self.is_running = True
+        
+        self.thread = threading.Thread(target=self._ponder_loop, daemon=True)
+        self.thread.start()
 
-    def get_absolute_score(self, board):
-        """
-        Calculates position evaluations normalized to White's physical perspective.
-        Adapts side-to-move relative scoring to unified evaluation metrics.
-        """
-        if not self.stockfish:
-            return None
-        try:
-            self.stockfish.set_fen_position(board.fen())
-            ev = self.stockfish.get_evaluation()
+    def update_position(self, fen):
+        """Called by the GUI to change the board position."""
+        with self.lock:
+            self.current_fen = fen
+
+    def stop(self):
+        """Safely kills the thread when closing the app."""
+        self.is_running = False
+
+    def _ponder_loop(self):
+        last_evaluated_fen = None
+        current_depth = 10
+        max_depth = 26
+        
+        while self.is_running:
+            with self.lock:
+                fen_to_eval = self.current_fen
+                
+            if fen_to_eval is None:
+                time.sleep(0.1)
+                continue
+                
+            if fen_to_eval != last_evaluated_fen:
+                last_evaluated_fen = fen_to_eval
+                current_depth = 10
+                self.stockfish.set_fen_position(fen_to_eval)
             
-            val = ev['value']
-            if ev['type'] == 'mate':
-                score = 10.0 if val > 0 else -10.0
+            if current_depth <= max_depth:
+                self.stockfish.set_depth(current_depth)
+                
+                eval_data = self.stockfish.get_evaluation()
+                top_moves_uci = self.stockfish.get_top_moves(3)
+                
+                # Convert UCI to SAN for human-readable lines
+                board = chess.Board(last_evaluated_fen)
+                top_moves_san = []
+                for move in top_moves_uci:
+                    try:
+                        san_move = board.san(chess.Move.from_uci(move["Move"]))
+                        top_moves_san.append(f"{san_move} ({move['Centipawn']/100 if move['Centipawn'] else f'M{move['Mate']}'})")
+                    except:
+                        top_moves_san.append(move["Move"])
+
+                with self.lock:
+                    if self.current_fen == last_evaluated_fen:
+                        self.result_queue.put({
+                            "fen": last_evaluated_fen,
+                            "depth": current_depth,
+                            "eval": eval_data,
+                            "lines": top_moves_san
+                        })
+                        current_depth += 2 
             else:
-                score = float(val) / 100.0
-                
-            # If the engine uses side-to-move perspective, invert it when it's Black's turn
-            if board.turn == chess.BLACK:
-                score = -score
-            return score
-        except Exception:
-            return None
+                time.sleep(0.2)
 
-    def generate_coach_critique(self, board_fen, game_state, role_context, move_san, is_blunder, score_shift):
-        """
-        Assembles structural tokens strictly using the Token Compilation Template
-        to execute atomic instructions without text completion hallucinations.
-        """
-        prompt = (
-            f"You are an elite International Master chess coach. Current Position (FEN): {board_fen}.\n"
-            f"Context: {game_state} The player driving pieces for {role_context} just played '{move_san}'.\n"
-        )
+def generate_coach_critique(model_name, previous_eval, current_eval, move_san):
+    """
+    Synchronous local LLM call via Ollama. It interprets the score shift.
+    (This should be wrapped in a thread by the GUI).
+    """
+    prev_score = previous_eval.get("value", 0) / 100 if previous_eval.get("type") == "cp" else 100
+    curr_score = current_eval.get("value", 0) / 100 if current_eval.get("type") == "cp" else 100
+    
+    score_shift = curr_score - prev_score
+    
+    if abs(score_shift) > 2.0:
+        prompt_context = f"The player played {move_san}. This was a critical blunder, shifting the evaluation by {score_shift:.2f} points. Aggressively explain the tactical mistake."
+    else:
+        prompt_context = f"The player played {move_san}. The position is relatively stable (shift: {score_shift:.2f}). Briefly explain the positional strategy here."
 
-        if is_blunder:
-            prompt += (
-                f"CRITICAL OVERRIDE: This move is an outright tactical blunder! The engine score swung by "
-                f"{abs(score_shift):.2f} pawns against them. Explicitly explain the immediate tactical punishment "
-                f"or loose piece vulnerability created by this blunder in exactly 2 concise sentences."
-            )
-        else:
-            prompt += (
-                f"Explain the strategic positional intention behind '{move_san}' (e.g., active piece development, "
-                f"securing an open file, creating space, or forcing tactical weaknesses) in exactly 2 clear sentences."
-            )
+    prompt = f"You are a master chess coach. Keep your answer under 3 sentences. {prompt_context}"
 
-        try:
-            response = ollama.chat(model=self.model_name, messages=[{'role': 'user', 'content': prompt}])
-            return response['message']['content'].strip()
-        except Exception:
-            # Resilient Model Transport Interception Path
-            return f"[Local AI engine offline: Run 'ollama run {self.model_name}' in your terminal to fix]"
+    try:
+        response = ollama.chat(model=model_name, messages=[
+            {"role": "system", "content": "You are a concise, insightful desktop chess AI coach."},
+            {"role": "user", "content": prompt}
+        ])
+        return response['message']['content']
+    except Exception as e:
+        return f"Coach is unavailable. Ensure Ollama is running. Error: {e}"
